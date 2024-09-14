@@ -9,7 +9,7 @@ app.secret_key = 'votre_cle_secrete'
 
 # Configuration de la connexion à la base de données
 def get_db_connection():
-    return pyodbc.connect('DRIVER={SQL Server};SERVER=abenamor;DATABASE=IRIS;Trusted_Connection=yes;')
+    return pyodbc.connect('DRIVER={SQL Server};SERVER=!!!;DATABASE=IRIS;Trusted_Connection=yes;')
 
 # Route pour la Page de connexion
 @app.route('/login', methods=['GET', 'POST'])
