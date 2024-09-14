@@ -1,0 +1,351 @@
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from functools import wraps
+from datetime import datetime
+import pyodbc
+import calendar
+
+app = Flask(__name__)
+app.secret_key = 'votre_cle_secrete'
+
+# Configuration de la connexion à la base de données
+def get_db_connection():
+    return pyodbc.connect('DRIVER={SQL Server};SERVER=abenamor;DATABASE=IRIS;Trusted_Connection=yes;')
+
+# Route pour la Page de connexion
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        CIN = request.form.get('CIN')
+        utilisateur = request.form.get('utilisateur')
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM acces_dash WHERE CIN = ? AND Utilisateur = ?", (CIN, utilisateur))
+        user = cursor.fetchone()
+        conn.close()
+
+        if user:
+            session['loggedin'] = True
+            session['CIN'] = CIN
+            session['utilisateur'] = utilisateur
+            flash('Connexion réussie', 'success')
+            return redirect(url_for('index'))
+        else:
+            flash('Identifiants incorrects', 'danger')
+
+    return render_template('login.html')
+
+# Décorateur pour vérifier la connexion
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('loggedin'):  # Vérifie si l'utilisateur est connecté
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# Route pour la Page d'Index (/index)
+@app.route('/index', methods=['GET', 'POST'])
+@login_required
+def index():
+    CIN = session.get('CIN', '')
+
+    # Conserver les valeurs dans la session
+    if request.method == 'POST':
+        if 'clear' in request.form:
+            session.pop('param_code', None)
+            session.pop('selected_year', None)
+            session.pop('selected_month', None)
+        else:
+            session['param_code'] = request.form.get('param_code', '').strip()
+            session['selected_year'] = request.form.get('year', '2024')
+            session['selected_month'] = request.form.get('month', '06')
+
+    # Récupérer les valeurs depuis la session
+    param_code = session.get('param_code', '')
+    selected_year = session.get('selected_year', '2024')
+    selected_month = session.get('selected_month', '06')
+
+    date_fin = f"{selected_year}-{selected_month}-30"
+    message = ''  # Message par défaut
+
+    # Connexion à la base de données pour obtenir les entités accessibles
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT CodeEntite, Entite FROM acces_dash WHERE CIN = ?", (CIN,))
+    accessible_entities = {row.CodeEntite: row.Entite for row in cursor.fetchall()}  # Dictionnaire des entités accessibles
+
+    # Initialise les résultats à vide par défaut
+    results = []
+    average_age_DA = None  # CompB- Délai d'approbation si Clear
+    average_age = None  # CompB- Délai de commande si Clear
+    average_age_clot = None  # CompB- Délai de livraison si Clear
+    somme_des_ages = None  # CompE
+    nb_bc_en_cours = ""  # CompC- Nb BC en cours si Clear
+    age_moyen_en_jours = ""  # CompC- Age BC en cours si Clear
+    end_date = None  # Initialisez end_date ici
+    eval_rows = []
+    bench_rows = []
+    message = ''
+
+    # Scénario 1: Aucun CodeEntite sélectionné ou bouton 'Clear' appuyé
+    if not param_code:
+        message = ''  # Laisse le message vide
+        results = []
+        eval_rows = []
+        bench_rows = []
+
+    # Scénario 2: CodeEntite sélectionné auquel l'utilisateur a accès
+    elif param_code in accessible_entities:
+        entite_name = accessible_entities[param_code]
+        message = f"Bienvenue dans le Tableau de bord de la société {entite_name}"
+
+        try:
+            # Calcul du dernier jour du mois sélectionné
+            start_date_str = f"{selected_year}-{selected_month}-01"
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+            last_day = calendar.monthrange(start_date.year, start_date.month)[1]
+            end_date = start_date.replace(day=last_day)
+
+            # Debugging
+            print(f"Date début: {start_date}, Date fin: {end_date}, CodeEntite: {param_code}")
+
+            # Requête pour calculer la moyenne de AgeApprobDA  {{ average_age_DA }}---COMP B
+            sql_query_age_avg_DA = """
+            SELECT AVG(AgeApprobDA) AS Moyenne_Age_DA
+            FROM DDA
+            WHERE DateTransfDA BETWEEN ? AND ?
+            AND (StDA <> 'x' OR StlgDA <> 'x')
+            AND CodeEntite = ?;
+            """
+            cursor.execute(sql_query_age_avg_DA, (start_date, end_date, param_code))
+            age_avg_DA_row = cursor.fetchone()
+            if age_avg_DA_row and age_avg_DA_row[0] is not None:
+                average_age_DA = age_avg_DA_row[0]
+
+            # Requête pour calculer la moyenne de Age_realis  {{ average_age }}---COMP B
+            sql_query_age_avg = """
+            SELECT AVG(Age_realis) AS Moyenne_Age
+            FROM BDD24
+            WHERE DateCreation BETWEEN ? AND ?
+            AND St <> 'x'
+            AND CodeEntite = ?;
+            """
+            cursor.execute(sql_query_age_avg, (start_date, end_date, param_code))
+            age_avg_row = cursor.fetchone()
+            if age_avg_row and age_avg_row[0] is not None:
+                average_age = age_avg_row[0]
+
+            # Requête pour calculer la moyenne de Age_clot_BC {{ average_age_clot }}---COMP B
+            sql_query_age_clot_avg = """
+            SELECT AVG(Age_clot_BC) AS Moyenne_Age_clot
+            FROM BDD24
+            WHERE DateCreation BETWEEN ? AND ?
+            AND St <> 'x'
+            AND CodeEntite = ?;
+            """
+            cursor.execute(sql_query_age_clot_avg, (start_date, end_date, param_code))
+            age_clot_avg_row = cursor.fetchone()
+            if age_clot_avg_row and age_clot_avg_row[0] is not None:
+                average_age_clot = age_clot_avg_row[0]
+
+            # Requête pour calculer NB BC EN COURS {{ nb_bc_en_cours }}---COMP C
+            sql_query_nb_bc_en_cours = """
+            SELECT COUNT(Ordre) AS Nb_BCenCours
+            FROM BDD24
+            WHERE St = '' AND CodeEntite = ?;
+            """
+            cursor.execute(sql_query_nb_bc_en_cours, (param_code,))
+            nb_bc_en_cours_row = cursor.fetchone()
+            if nb_bc_en_cours_row and nb_bc_en_cours_row[0] is not None:
+                nb_bc_en_cours = nb_bc_en_cours_row[0]
+
+            # Requête pour calculer AGE BC EN COURS {{ age_moyen }}---COMP C
+            sql_query_age_moyen_en_jours = """
+            SELECT AVG(DATEDIFF(DAY, DateCreation, ?)) AS AgeEnJoursMoyen
+            FROM BDD24
+            WHERE St = '' AND CodeEntite = ?
+            """
+            cursor.execute(sql_query_age_moyen_en_jours, (end_date, param_code))
+            age_moyen_en_jours_row = cursor.fetchone()
+            if age_moyen_en_jours_row and age_moyen_en_jours_row[0] is not None:
+                age_moyen_en_jours = age_moyen_en_jours_row[0]
+
+            # Calcul de la somme des trois valeurs---COMP E
+            if average_age is not None and average_age_clot is not None and age_moyen_en_jours is not None:
+                somme_des_ages = average_age + average_age_clot + age_moyen_en_jours
+            else:
+                somme_des_ages = None  # Valeur par défaut si une des moyennes est None
+
+            # Requête pour afficher Evaluation ---COMP D
+            sql_query_eval = """
+            SELECT Criteria, CodeCriteria, Note
+            FROM EVOP
+            WHERE CodeEntite = ? 
+              AND CodeCriteria IN ('ZZ08', 'ZZ05', 'ZZ90', 'ZZ91', 'ZZ03', 'ZZ10', 'ZZ92', 'ZZ15', 'ZZ14', 'ZZ17', 'ZZ90', 'EV10', 'EV11', 'EV12', 'EV13', 'EV14', 'EV15', 'EV16', 'EV17')
+              AND Date = ?;
+            """
+            cursor.execute(sql_query_eval, (param_code, start_date))
+            eval_rows = cursor.fetchall()
+            eval_rows = [
+                {
+                    'Criteria': row.Criteria or '',
+                    'CodeCriteria': row.CodeCriteria or '',
+                    'Note': row.Note if row.Note is not None else 0
+                } for row in eval_rows
+            ]
+
+            # Requête pour afficher Benchmark ---COMP F
+            sql_query_bench = """
+            WITH RankedBench AS (
+                SELECT Classement, CodeEntite, Entite, TRRMP, 
+                       DENSE_RANK() OVER (ORDER BY Classement ASC) AS Rank
+                FROM BENCH
+            ), TargetEntity AS (
+                SELECT Classement, CodeEntite, Entite, TRRMP, Rank
+                FROM RankedBench
+                WHERE CodeEntite = ?
+            )
+            SELECT Classement, CodeEntite, Entite, TRRMP, Rank
+            FROM RankedBench
+            WHERE Rank BETWEEN (SELECT Rank - 5 FROM TargetEntity)
+            AND (SELECT Rank + 5 FROM TargetEntity)
+            ORDER BY Rank;
+            """
+            cursor.execute(sql_query_bench, (param_code,))
+            bench_rows = cursor.fetchall()
+            bench_rows = [
+                {
+                    'Classement': row.Classement,
+                    'CodeEntite': row.CodeEntite or '',
+                    'Entite': row.Entite or '',
+                    'TRRMP': row.TRRMP if row.TRRMP is not None else 0,
+                    'highlight': row.CodeEntite == param_code
+                } for row in bench_rows
+            ]
+
+        except Exception as e:
+            message = f"Erreur: {str(e)}"
+            print(f"Erreur: {str(e)}")
+
+        finally:
+            cursor.close()
+            conn.close()
+    # Scénario 3: CodeEntite sélectionné auquel l'utilisateur n'a pas accès
+    else:
+        message = "Vous n'avez pas accès à l'entité sélectionnée. Merci de vous adresser à l'administrateur."
+        conn.close()  # Fermer la connexion avant de retourner la réponse
+        return render_template('index.html',
+                               message=message,
+                               param_code=param_code,
+                               selected_year=selected_year,
+                               selected_month=selected_month,
+                               eval_rows=eval_rows,
+                               results=[])
+
+    return render_template('index.html',                           
+                            param_code=param_code,
+                            selected_year=selected_year,
+                            selected_month=selected_month,
+                            results=results,
+                            accessible_entities=accessible_entities,
+                            average_age_DA=average_age_DA,
+                            average_age=average_age,
+                            average_age_clot=average_age_clot,
+                            somme_des_ages=somme_des_ages,
+                            nb_bc_en_cours=nb_bc_en_cours,
+                            age_moyen_en_jours=age_moyen_en_jours,
+                            message=message,
+                            end_date=end_date,
+                            eval_rows=eval_rows,
+                            rows=bench_rows)
+
+
+
+
+
+
+# Route pour la Page de detail-bc (/detail-bc)
+@app.route('/detail-bc', methods=['GET'])
+
+def detail_bc():
+    code_entite = request.args.get('code_entite')
+    date_fin = request.args.get('date_fin')
+
+    if not code_entite or not date_fin:
+        flash(" ", 'error')
+        return redirect(url_for('index'))
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = """
+    SELECT 
+        Ordre, 
+        DateCreation, 
+        DateTransAchat, 
+        NomUtilisateur, 
+        Article, 
+        DateEcheance,
+        DATEDIFF(DAY, DateCreation, ?) AS AgeEnJours
+    FROM 
+        BDD24
+    WHERE 
+        St = '' 
+        AND CodeEntite = ?
+    ORDER BY 
+        DateEcheance ASC
+    """
+    cursor.execute(query, (date_fin, code_entite))
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    return render_template('detail_bc.html', results=results, code_entite=code_entite, date_fin=date_fin)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    # Retirer les données de session
+    session.pop('loggedin', None)
+    session.pop('CIN', None)
+    session.pop('utilisateur', None)
+
+    # Ajouter un message de succès pour la déconnexion
+    flash('Déconnexion réussie.', 'success')
+
+    # Redirection vers la page de connexion
+    return redirect(url_for('login'))
+
+
+
+
+
+
+# Ajout de la route pour la racine '/'
+@app.route('/')
+def home():
+    return redirect(url_for('login'))
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000, debug=True)
+
